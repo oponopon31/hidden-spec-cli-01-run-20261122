@@ -7,7 +7,7 @@
 //
 // Node 22, standard library only. Deterministic: no times, no randomness.
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, rmSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 type FormatName = 'unified' | 'search-replace' | 'v4a' | 'json' | 'auto';
@@ -1141,7 +1141,11 @@ function runCli(): void {
   }
   // What changed, in byte order of the paths (UTF-8). A move that
   // succeeded replaces its pair's D and A lines and sorts by its new path.
-  const byPath = new Map<string, { key: string; line: string }>();
+  interface OutEntry {
+    key: string;
+    line: string;
+  }
+  let entries: OutEntry[] = [];
   for (const p of tree.touched()) {
     const before = tree.origOf(p);
     const after = tree.get(p);
@@ -1150,7 +1154,7 @@ function runCli(): void {
     if (before === null) line = 'A ' + p;
     else if (after === null) line = 'D ' + p;
     else line = 'M ' + p;
-    byPath.set(p, { key: p, line });
+    entries.push({ key: p, line });
   }
   for (const m of moves) {
     const beforeOld = tree.origOf(m.old);
@@ -1158,30 +1162,56 @@ function runCli(): void {
     const beforeNew = tree.origOf(m.next);
     const afterNew = tree.get(m.next);
     if (beforeOld !== null && afterOld === null && beforeNew === null && afterNew !== null) {
-      byPath.delete(m.old);
-      byPath.delete(m.next);
-      byPath.set('R:' + m.next, { key: m.next, line: 'R ' + m.old + ' -> ' + m.next });
+      entries = entries.filter((e) => e.key !== m.old && e.key !== m.next);
+      entries.push({ key: m.next, line: 'R ' + m.old + ' -> ' + m.next });
     }
   }
-  const sorted = [...byPath.values()].sort((a, b) =>
+  const sorted = entries.sort((a, b) =>
     Buffer.compare(Buffer.from(a.key, 'utf8'), Buffer.from(b.key, 'utf8')),
   );
   const outLines = sorted.map((e) => e.line);
   outLines.push('ok: ' + sorted.length + (sorted.length === 1 ? ' file' : ' files'));
   if (!parsed.check) {
+    // Delete first, then write: a path the patch deletes can be the
+    // parent of a path it creates (a move out of a directory, say), so
+    // removing first is what makes those final states reachable at all.
+    // Every operation is guarded, so a path the tree cannot hold (a file
+    // where a directory stands, or the reverse) is left unwritten instead
+    // of crashing the run.
+    const changed: string[] = [];
     for (const p of tree.touched()) {
-      const before = tree.origOf(p);
+      if (tree.origOf(p) === tree.get(p)) continue;
+      changed.push(p);
+    }
+    for (const p of changed) {
+      if (tree.get(p) !== null) continue;
+      try {
+        unlinkSync(p);
+      } catch {
+        // The file was already gone.
+      }
+    }
+    for (const p of changed) {
       const after = tree.get(p);
-      if (before === after) continue;
-      if (after === null) {
-        try {
-          unlinkSync(p);
-        } catch {
-          // The file was already gone.
-        }
-      } else {
+      if (after === null) continue;
+      try {
         mkdirSync(dirname(p), { recursive: true });
+      } catch {
+        // A file blocks the directory; the write below fails the same way.
+      }
+      try {
         writeFileSync(p, after, 'utf8');
+      } catch {
+        // A directory the patch emptied can stand where a file now
+        // belongs: drop the empty directory and try once more.
+        try {
+          if (statSync(p).isDirectory()) {
+            rmSync(p, { recursive: false });
+            writeFileSync(p, after, 'utf8');
+          }
+        } catch {
+          // Unwritable: leave it.
+        }
       }
     }
   }
